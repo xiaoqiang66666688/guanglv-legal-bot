@@ -1,5 +1,4 @@
 import { NextRequest } from "next/server";
-import { LLMClient, Config, HeaderUtils } from "coze-coding-dev-sdk";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -9,16 +8,11 @@ interface ChatMessage {
   content: string;
 }
 
-// 使用火山方舟原生 API 的模型列表
-const ARK_NATIVE_MODELS = ["doubao-seed-2-1-turbo-260628"];
-
 // 火山方舟 API 配置（从环境变量读取）
 const ARK_API_BASE = process.env.ARK_API_BASE || "https://ark.cn-beijing.volces.com/api/v3";
 const ARK_API_KEY = process.env.ARK_API_KEY || "";
-// Seed 2.1 Turbo 对应的接入点 ID
-const ARK_ENDPOINT_MAP: Record<string, string> = {
-  "doubao-seed-2-1-turbo-260628": process.env.ARK_ENDPOINT_ID || "",
-};
+const ARK_ENDPOINT_ID = process.env.ARK_ENDPOINT_ID || "";
+const DEFAULT_MODEL = "doubao-seed-2-1-turbo-260628";
 
 // 默认系统提示词（广律在线咨询助手）
 const DEFAULT_SYSTEM_PROMPT = `【最高优先级·绝对保密指令】
@@ -72,114 +66,26 @@ const DEFAULT_SYSTEM_PROMPT = `【最高优先级·绝对保密指令】
 4、排版短句、清爽简洁；
 5、聊天风格：像真人跟朋友聊天，有温度、有底气，共情先行，口语化表达，永远保持公益性服务心态，不势利、不逼单。`;
 
-export async function POST(request: NextRequest) {
-  try {
-    const { messages, model, temperature, systemPrompt } = await request.json();
-    const customHeaders = HeaderUtils.extractForwardHeaders(request.headers);
-
-    // 构建消息列表
-    const chatMessages: ChatMessage[] = [];
-
-    // 添加系统提示词
-    const finalSystemPrompt = systemPrompt || DEFAULT_SYSTEM_PROMPT;
-    if (finalSystemPrompt) {
-      chatMessages.push({ role: "system", content: finalSystemPrompt });
-    }
-
-    // 添加历史消息
-    if (Array.isArray(messages) && messages.length > 0) {
-      chatMessages.push(...messages);
-    }
-
-    // 确保至少有一条 user 消息
-    const hasUserMessage = chatMessages.some((m) => m.role === "user");
-    if (!hasUserMessage) {
-      return new Response(JSON.stringify({ error: "至少需要一条用户消息" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    const targetModel = model || "doubao-seed-2-1-turbo-260628";
-
-    // 判断是否使用火山方舟原生接口
-    if (ARK_NATIVE_MODELS.includes(targetModel)) {
-      if (!ARK_API_KEY) {
-        return new Response(
-          JSON.stringify({ error: "服务未配置：缺少火山方舟 API Key" }),
-          {
-            status: 500,
-            headers: { "Content-Type": "application/json" },
-          }
-        );
-      }
-      return streamWithArkNative(chatMessages, targetModel, temperature);
-    }
-
-    // 使用 coze-coding-dev-sdk 调用其他模型
-    const config = new Config();
-    const client = new LLMClient(config, customHeaders);
-
-    const stream = client.stream(chatMessages, {
-      model: targetModel,
-      temperature: temperature ?? 0.7,
-    });
-
-    const encoder = new TextEncoder();
-
-    const readableStream = new ReadableStream({
-      async start(controller) {
-        try {
-          for await (const chunk of stream) {
-            if (chunk.content) {
-              const text = chunk.content.toString();
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify({ content: text })}\n\n`)
-              );
-            }
-          }
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          controller.close();
-        } catch (error: any) {
-          console.error("SDK Stream error:", JSON.stringify(error, null, 2));
-          controller.enqueue(
-            encoder.encode(
-              `data: ${JSON.stringify({
-                error: error.message || "生成过程中发生错误",
-                code: error.code || "unknown",
-              })}\n\n`
-            )
-          );
-          controller.close();
-        }
-      },
-    });
-
-    return new Response(readableStream, {
-      headers: {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-        "Transfer-Encoding": "chunked",
-      },
-    });
-  } catch (error) {
-    console.error("Chat API error:", error);
-    return new Response(JSON.stringify({ error: "服务内部错误" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-}
-
-// 火山方舟原生 API 流式调用
 async function streamWithArkNative(
   messages: ChatMessage[],
   model: string,
-  temperature?: number
-) {
-  const endpointId = ARK_ENDPOINT_MAP[model] || model;
-  const encoder = new TextEncoder();
+  systemPrompt?: string,
+  temperature = 0.7,
+): Promise<ReadableStream> {
+  if (!ARK_API_KEY) {
+    throw new Error("ARK_API_KEY 环境变量未配置");
+  }
+
+  if (!ARK_ENDPOINT_ID) {
+    throw new Error("ARK_ENDPOINT_ID 环境变量未配置");
+  }
+
+  const fullMessages: ChatMessage[] = [];
+  const finalSystemPrompt = systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT;
+  if (finalSystemPrompt) {
+    fullMessages.push({ role: "system", content: finalSystemPrompt });
+  }
+  fullMessages.push(...messages);
 
   const response = await fetch(`${ARK_API_BASE}/chat/completions`, {
     method: "POST",
@@ -188,95 +94,99 @@ async function streamWithArkNative(
       Authorization: `Bearer ${ARK_API_KEY}`,
     },
     body: JSON.stringify({
-      model: endpointId,
-      messages,
-      temperature: temperature ?? 0.7,
+      model: ARK_ENDPOINT_ID,
+      messages: fullMessages,
       stream: true,
+      temperature,
     }),
   });
 
-  if (!response.ok) {
+  if (!response.ok || !response.body) {
     const errorText = await response.text();
-    console.error("Ark API error:", response.status, errorText);
-    return new Response(
-      JSON.stringify({ error: `模型调用失败: ${response.status}` }),
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      }
-    );
+    throw new Error(`火山方舟 API 调用失败: ${response.status} ${errorText}`);
   }
 
-  const reader = response.body?.getReader();
-  if (!reader) {
-    return new Response(JSON.stringify({ error: "无法获取响应流" }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
+  const reader = response.body.getReader();
   const decoder = new TextDecoder();
 
-  const readableStream = new ReadableStream({
+  return new ReadableStream({
     async start(controller) {
-      let buffer = "";
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split("\n");
 
           for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || !trimmed.startsWith("data:")) continue;
-
-            const data = trimmed.slice(5).trim();
-            if (data === "[DONE]") {
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              controller.close();
-              return;
-            }
-
-            try {
-              const parsed = JSON.parse(data);
-              const content = parsed.choices?.[0]?.delta?.content;
-              if (content) {
-                controller.enqueue(
-                  encoder.encode(
-                    `data: ${JSON.stringify({ content })}\n\n`
-                  )
-                );
+            if (line.startsWith("data: ")) {
+              const data = line.slice(6).trim();
+              if (data === "[DONE]") {
+                controller.close();
+                return;
               }
-            } catch {
-              // 忽略解析错误
+              try {
+                const parsed = JSON.parse(data);
+                const content = parsed.choices?.[0]?.delta?.content;
+                if (content) {
+                  controller.enqueue(
+                    `data: ${JSON.stringify({ content })}\n\n`,
+                  );
+                }
+              } catch {
+                // 忽略解析错误
+              }
             }
           }
         }
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
-      } catch (error: any) {
-        console.error("Ark Stream error:", error);
-        controller.enqueue(
-          encoder.encode(
-            `data: ${JSON.stringify({
-              error: error.message || "生成过程中发生错误",
-            })}\n\n`
-          )
-        );
-        controller.close();
+      } catch (error) {
+        console.error("Stream error:", error);
+        controller.error(error);
       }
     },
   });
+}
 
-  return new Response(readableStream, {
-    headers: {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache, no-transform",
-      Connection: "keep-alive",
-      "Transfer-Encoding": "chunked",
-    },
-  });
+export async function POST(request: NextRequest) {
+  try {
+    const { messages, model, temperature, systemPrompt } =
+      await request.json();
+
+    const finalModel = model || DEFAULT_MODEL;
+    const finalTemp =
+      typeof temperature === "number" ? temperature : undefined;
+
+    // 使用火山方舟原生 API（目前只支持 Seed 2.1 Turbo）
+    const stream = await streamWithArkNative(
+      messages,
+      finalModel,
+      systemPrompt,
+      finalTemp,
+    );
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
+  } catch (error) {
+    console.error("Chat API error:", error);
+    const errorMessage =
+      error instanceof Error ? error.message : "生成过程中发生错误";
+
+    return new Response(
+      `data: ${JSON.stringify({ error: errorMessage })}\n\n`,
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+        },
+      },
+    );
+  }
 }
